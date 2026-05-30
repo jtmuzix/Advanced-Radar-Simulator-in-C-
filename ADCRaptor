@@ -1,0 +1,803 @@
+# RAPTOR — Research-Grade Radar Simulation Suite
+
+RAPTOR is a self-contained C++17 radar simulation, signal-processing, imaging, tracking, and research-export workbench. It contains an analytical radar engine, a first-principles FDTD electromagnetic solver path, deterministic parallel random generation, optional OpenMP/MPI support, optional accelerator backends, and a broad command-line surface for radar phenomenology, RF impairments, clutter, electronic protection, target ingestion, MIMO/DOA processing, range-angle-Doppler products, truth scoring, Monte Carlo campaigns, and interoperability exports.
+
+This README is source-derived for this release: it documents **all 342 command-line flags parsed by `src/raptor.cpp`**. CPU execution is the default; CUDA, ROCm/HIP, and Vulkan are optional build/runtime backends.
+
+## Table of contents
+
+- [Project layout](#project-layout)
+
+- [Architecture overview](#architecture-overview)
+
+- [Execution pipeline](#execution-pipeline)
+
+- [Build matrix](#build-matrix)
+
+- [Quick-start examples](#quick-start-examples)
+
+- [Scenario-file system](#scenario-file-system)
+
+- [Data products and interoperability](#data-products-and-interoperability)
+
+- [Accelerator backend model](#accelerator-backend-model)
+
+- [Validation and regression](#validation-and-regression)
+
+- [Complete command-line flag reference](#complete-command-line-flag-reference)
+
+- [Recommended research workflows](#recommended-research-workflows)
+
+- [Implementation notes and limitations](#implementation-notes-and-limitations)
+
+## Project layout
+
+```
+raptor\_release\_multi\_backend/  
+  src/  
+    raptor.cpp                 \# Main C++17 simulation, CLI, analytical engine, FDTD path, exports, validation  
+    raptor\_cuda\_bridge.h/.cu   \# Optional CUDA backend bridge and kernels  
+    raptor\_rocm\_bridge.h/.cpp  \# Optional ROCm/HIP backend bridge and kernels  
+    raptor\_vulkan\_bridge.h/.cpp\# Optional Vulkan compute backend bridge  
+  CMakeLists.txt               \# CMake build for CPU/OpenMP/MPI/CUDA/ROCm/Vulkan  
+  Makefile                     \# Convenience build, smoke, validation, and regression targets  
+  README.md                    \# This comprehensive guide  
+  docs/                        \# Supplemental implementation notes and historical patch reports  
+  examples/                    \# Example scenario, target, mesh, and scatterer inputs  
+  tests/                       \# Regression shell tests  
+  tools/                       \# Patch/history helper scripts retained for auditability
+```
+
+## Architecture overview
+
+### 1. Configuration and command-line layer
+
+The `Config` structure is the central configuration object. `parse\_args()` merges scenario-file tokens with direct CLI tokens, validates numeric bounds, normalizes several derived values, and preserves legacy behavior by warning on unknown flags rather than terminating. Scenario files are intentionally loaded first, so explicit command-line flags override scenario-file values.
+
+Key implementation points:
+
+- `merge\_scenario\_and\_cli()` loads `--scenario` YAML/JSON values before normal CLI parsing.
+
+- `validate\_config()` clamps critical numeric settings such as FFT size, CFAR windows, pulse count, array count, PFA, and accelerator backend aliases.
+
+- `DetRNG` provides deterministic counter-based random numbers when `--det-par` is enabled, avoiding OpenMP schedule-dependent random streams.
+
+- All vector geometry flags use the `x:y:z` convention.
+
+### 2. Analytical radar engine
+
+The analytical path is the default solver. It synthesizes pulse/frequency histories, target scatterer returns, clutter, thermal noise, RF impairments, array responses, mutual coupling, beamforming/adaptive processing, pulse compression, RDM/ISAR/RAD products, detections, metrics, and exports. Major classes and functions include:
+
+| Component | Role |
+| - | - |
+| `Vec3`, `RotMat` | Lightweight 3D geometry and target orientation math. |
+| `fft()`, `frft()` | Built-in radix-2 FFT/IFFT and fractional Fourier path for dependency-free processing. |
+| `ArrayAntenna` | Linear, conformal, cell-free, and OAM-style element placement and phase steering. |
+| `Target`, `Scatterer`, `SwerlingGen` | Built-in target models, mesh/scatterer ingestion, Swerling fluctuation, rotor/gait/cavity/plume/glint effects. |
+| `Waveform` | LFM, OFDM, quantum/noise waveform, polyphase code, passive illuminator, hopping, and ISAC modulation samples. |
+| `Atmosphere`, clutter helpers | Propagation loss, environment attenuation, correlated/advanced clutter, sea/weather/vegetation effects. |
+| CFAR/detector functions | 1D/2D CFAR and additional detector products including GLRT/AMF/ACE/Wald/Rao-style threshold products. |
+| Export helpers | CSV/binary/PGM/SigMF/VITA-like/MATLAB v4/NumPy outputs, truth, detections, metrics, tracks, RAD tensors. |
+
+
+### 3. FDTD electromagnetic solver path
+
+`--solver fdtd` switches to the volumetric FDTD engine. This path allocates E/H field grids, updates magnetic and electric fields, optionally models a Drude-like plasma current term, injects a source, and supports MPI z-domain decomposition when built with `USE\_MPI`. Local-domain validation prevents unsafe `size\_t` underflow and invalid ghost-plane access.
+
+### 4. Accelerator backend layer
+
+CPU is always the default backend. Optional native CUDA, ROCm/HIP, and Vulkan compute bridges implement accelerated range-cube/RDM products when the matching build is selected. Runtime selection is handled by `--backend cpu|cuda|rocm|vulkan` and compatibility aliases such as `--gpu`, `--cuda`, `--rocm`, `--hip`, and `--vulkan`. CPU-only binaries refuse accelerator requests unless a backend-specific fallback policy applies in an accelerator-enabled build.
+
+### 5. Research-product layer
+
+The research layer exports intermediate and final products for external analysis: raw IQ, range-compressed cubes, complex/magnitude RDMs, threshold maps, masks, calibrated axes, truth tables, detections, metrics, ROC/Pd-Pfa sweeps, DOA spectra, range-angle maps, RAD tensors, TBD paths, super-resolution estimates, tracks, and interoperability files.
+
+## Execution pipeline
+
+1. **Configuration load**: scenario file, CLI overrides, validation, output-directory prefixing.
+
+2. **Mode dispatch**: validation-only, Monte Carlo campaign, FDTD solver, or analytical radar engine.
+
+3. **Scene initialization**: target model, optional scatterer/mesh/targets file, array geometry, waveform, RAM table, clutter states, chaff/bio/passive illuminators.
+
+4. **Propagation loop**: for each pulse and frequency bin, synthesize waveform phase, scatterer propagation, RCS/polarimetry, clutter/noise, jamming/interference, array impairments, mutual coupling, and beamforming.
+
+5. **Adaptive processing**: optional MVDR/STAP-SMI covariance, MTI, keystone/range-walk correction, windowing.
+
+6. **Image/product formation**: ISAR, legacy RDM, true 2D RDM, or RAD products.
+
+7. **Detection/tracking/research products**: CFAR or alternate detectors, truth scoring, track/TBD outputs, DOA/range-angle/RAD outputs, super-resolution estimates.
+
+8. **Output**: terminal display map, CSV/binary/PGM/metadata/interoperability files, UDP/VITA-style products.
+
+## Build matrix
+
+### CPU/OpenMP default
+
+```
+make
+```
+
+Manual GCC build:
+
+```
+g++ -std=c++17 -O3 -Wall -Wextra -Wpedantic -fopenmp src/raptor.cpp -o raptor
+```
+
+### MPI/FDTD build
+
+```
+make clean  
+make MPI=1
+```
+
+### CUDA build
+
+```
+make clean  
+make CUDA=1 OPENMP=1  
+  
+cmake -S . -B build-cuda -DRAPTOR\_ENABLE\_CUDA=ON -DRAPTOR\_ENABLE\_OPENMP=ON  
+cmake --build build-cuda -j
+```
+
+### ROCm/HIP build
+
+```
+make clean  
+make ROCM=1 OPENMP=1  
+  
+cmake -S . -B build-rocm -DRAPTOR\_ENABLE\_ROCM=ON -DRAPTOR\_ENABLE\_OPENMP=ON  
+cmake --build build-rocm -j
+```
+
+### Vulkan compute build
+
+```
+make clean  
+make VULKAN=1 OPENMP=1  
+  
+cmake -S . -B build-vulkan -DRAPTOR\_ENABLE\_VULKAN=ON -DRAPTOR\_ENABLE\_OPENMP=ON  
+cmake --build build-vulkan -j
+```
+
+The Makefile intentionally allows only one native accelerator at a time. The CPU path remains dependency-free apart from the C++ compiler and optional OpenMP runtime.
+
+## Quick-start examples
+
+### Minimal true 2D range-Doppler run
+
+```
+./raptor --det-par --seed 42 --mode rdm --rdm-2d --pulses 32 --n-fft 64 --res 32 --cfar-2d --out runs/rdm.csv --meta-file runs/rdm.json
+```
+
+### Research smoke test
+
+```
+make research-smoke
+```
+
+### Scenario-file run
+
+```
+./raptor --scenario examples/scenario.yaml --det-par --seed 5 \\  
+  --output-dir runs/scenario --out image.csv --metrics-out metrics.json \\  
+  --detections-out detections.csv --truth-out truth.csv --save-scenario resolved.json
+```
+
+### MIMO/DOA/RAD tensor run
+
+```
+./raptor --det-par --seed 42 --mode rad --rdm-2d --pulses 16 --n-fft 32 --res 16 \\  
+  --mimo-virtual-array --mimo-tx 2 --mimo-rx 8 --doa capon --angle-grid -60:60:2 \\  
+  --angle-out doa.csv --range-angle-out range\_angle.csv --rad-cube-out rad.csv \\  
+  --output-dir runs/rad --out image.csv
+```
+
+### Accelerator selection
+
+```
+./raptor --backend cpu  
+./raptor --backend cuda --backend-device 0 --backend-verify --mode rdm --rdm-2d  
+./raptor --backend rocm --backend-device 0 --backend-verify --mode rdm --rdm-2d  
+./raptor --backend vulkan --backend-device 0 --backend-verify --mode rdm --rdm-2d
+```
+
+## Scenario-file system
+
+`--scenario` accepts a dependency-free YAML subset or JSON-style file. Keys are normalized by converting underscores to dashes and using the final component of nested keys. Example: `radar.fc`, `radar: \{ fc: ... \}`, and `fc` all map to `--fc` after normalization. Three-element vectors such as `\[0, 15000, 5000\]` become `0:15000:5000`.
+
+Rules:
+
+- Scenario values are parsed before direct CLI flags; direct CLI wins.
+
+- Boolean `true` maps to a switch flag; `false` and `null` are ignored.
+
+- YAML comments after `\#` are ignored.
+
+- Nested YAML mappings are supported for scalar leaves.
+
+- `--save-scenario` writes a resolved JSON snapshot of key simulation settings.
+
+Example YAML:
+
+```
+radar:  
+  fc: 10e9  
+  bw: 500e6  
+  prf: 3000  
+  pulses: 128  
+  n\_fft: 128  
+processing:  
+  mode: rdm  
+  rdm\_2d: true  
+  cfar\_2d: true  
+target:  
+  pos: \[0, 18000, 5000\]  
+  vel: \[220, -120, 0\]
+```
+
+## Data products and interoperability
+
+| Product family | Primary flags | Notes |
+| - | - | - |
+| Main image | `--out`, `--format`, `--image-out`, `--output-log-db` | CSV/bin output plus PGM image export. |
+| Metadata | `--meta-file`, `--save-scenario`, `--profile-out` | JSON-style metadata, resolved configuration snapshot, profile metadata. |
+| Raw and cube products | `--export-raw-iq`, `--export-range-cube`, `--export-rdm-complex`, `--export-rdm-mag` | Raw pulse/frequency history and processed range/RDM products. |
+| Detector products | `--export-threshold-map`, `--threshold-map-out`, `--export-detection-mask`, `--detections-out` | Threshold maps, masks, and ranked detections. |
+| Truth/scoring | `--truth-out`, `--metrics-out`, `--roc-out`, `--pd-pfa-out` | Truth-aligned evaluation and detection performance products. |
+| MIMO/DOA/RAD | `--angle-out`, `--range-angle-out`, `--rad-cube-out`, `--axes-out` | Angle spectra, range-angle maps, range-angle-Doppler tensor CSV, calibrated axes. |
+| Tracking/TBD | `--track-out`, `--track-metrics-out`, `--tbd-out` | Multi-target track exports and track-before-detect path exports. |
+| Interoperability | `--export-sigmf`, `--export-vita49`, `--export-matlab`, `--export-numpy`, `--udp-host`, `--udp-port` | SDR/research-tool friendly outputs. |
+
+
+## Accelerator backend model
+
+The runtime backend selector is `--backend cpu|cuda|rocm|vulkan`. CPU is default and is always available. Accelerator flags only execute in binaries built with the matching backend compile definition. Backend verification compares accelerated products with CPU reference products using `--backend-tolerance`.
+
+| Backend | Build switch | Runtime selector | Notes |
+| - | - | - | - |
+| CPU/OpenMP | default | `--backend cpu` | Dependency-free default path. |
+| CUDA | `make CUDA=1` or `RAPTOR\_ENABLE\_CUDA=ON` | `--backend cuda`, `--cuda`, `--gpu` | NVIDIA CUDA path. Legacy flags preserved. |
+| ROCm/HIP | `make ROCM=1` or `RAPTOR\_ENABLE\_ROCM=ON` | `--backend rocm`, `--rocm`, `--hip` | AMD HIP kernel path. |
+| Vulkan compute | `make VULKAN=1` or `RAPTOR\_ENABLE\_VULKAN=ON` | `--backend vulkan`, `--vulkan` | Vulkan compute path requiring Vulkan and shaderc. |
+
+
+## Validation and regression
+
+```
+make smoke  
+make research-smoke  
+make validate  
+bash tests/regression\_research.sh
+```
+
+`--validate-physics` runs internal sanity checks for transform round trips, deterministic RNG, and basic validation logic. The regression script exercises research exports, deterministic behavior, and expected output-file generation.
+
+## Complete command-line flag reference
+
+Conventions used below:
+
+- **Switch** flags take no value and default to off unless otherwise stated.
+
+- **Vec3** flags use `x:y:z` with SI units unless the flag states otherwise.
+
+- **Path** flags are resolved relative to the working directory unless `--output-dir` prefixes output products.
+
+- Unknown flags are warned and ignored for legacy compatibility.
+
+### Determinism / Coupling / RDM / CFAR
+
+Controls reproducibility, mutual coupling physics, range-Doppler processing, and two-dimensional CFAR geometry.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--det-par` | switch | `off` | `det\_par` | Enable deterministic counter-based parallel RNG |
+| `--seed` | uint64 | `1234ULL` | `seed` | Set deterministic RNG seed |
+| `--coupling-kappa` | double | `0.05` | `coupling\_kappa` | Mutual-coupling magnitude coefficient |
+| `--coupling-decay-lambda` | double | `0.5` | `coupling\_decay\_lambda` | Mutual-coupling exponential decay distance in wavelengths |
+| `--lfm-centered` | switch | `true` | `lfm\_centered` | Use centered LFM spectral bins |
+| `--lfm-uncentered` | special | `true` | `lfm\_centered` | Use uncentered LFM spectral bins |
+| `--rdm-2d` | switch | `off` | `rdm\_2d` | Enable true 2D range-Doppler processing |
+| `--rdm-window-slow` | string/path/selector | `"hamming"` | `rdm\_window\_slow` | Slow-time RDM window |
+| `--rdm-window-fast` | string/path/selector | `"hamming"` | `rdm\_window\_fast` | Fast-time/range RDM window |
+| `--rdm-fft-shift` | switch | `true` | `rdm\_fft\_shift` | Center Doppler axis |
+| `--rdm-doppler-fft` | integer | `0` | `rdm\_doppler\_fft` | Doppler FFT length |
+| `--cfar-2d` | switch | `off` | `cfar\_2d` | Use 2D CFAR thresholding |
+| `--cfar-guard-x` | integer | `-1` | `cfar\_guard\_x` | 2D CFAR x guard cells |
+| `--cfar-guard-y` | integer | `-1` | `cfar\_guard\_y` | 2D CFAR y guard cells |
+| `--cfar-ref-x` | integer | `-1` | `cfar\_ref\_x` | 2D CFAR x reference cells |
+| `--cfar-ref-y` | integer | `-1` | `cfar\_ref\_y` | 2D CFAR y reference cells |
+| `--cfar-os-quantile` | double | `0.75` | `cfar\_os\_quantile` | OS-CFAR quantile |
+
+
+### Solver / HPC / HIL
+
+Selects the analytical radar engine or FDTD EM solver, plus optional distributed/HIL-oriented configuration.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--solver` | string/path/selector | `"analytical"` | `solver` | Analytical engine or FDTD solver |
+| `--cole-cole` | string/path/selector | `empty` | `cole\_cole` | Cole-Cole dispersive media input |
+| `--sar-bio` | double | `0.0` | `sar\_bio` | Specific absorption / bio-EM parameter |
+| `--mpi-nodes` | integer | `1` | `mpi\_nodes` | Requested MPI node count |
+| `--shm-zero-copy` | switch | `off` | `shm\_zero\_copy` | Shared-memory zero-copy flag |
+| `--precision` | string/path/selector | `"fp64"` | `precision` | Numerical precision policy |
+| `--vita49-stream` | string/path/selector | `empty` | `vita49\_stream` | VITA-49 output endpoint |
+| `--s-param-import` | string/path/selector | `empty` | `s\_param\_import` | Touchstone/S-parameter input |
+| `--dac-spur` | double | `-100.0` | `dac\_spur` | DAC spur level |
+| `--gym-env` | switch | `off` | `gym\_env` | Gym/PettingZoo interface flag |
+
+
+### Core Radar Scenario
+
+Top-level operating mode and core processing toggles used by the analytical engine.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--mode` | string/path/selector | `"isar"` | `mode` | Image output mode |
+| `--algo` | string/path/selector | `"bp"` | `algo` | Algorithm selector |
+| `--tbd` | switch | `off` | `tbd` | Track-before-detect flag |
+| `--blind-zones` | switch | `off` | `blind\_zones` | Blind-zone modeling flag |
+| `--pc` | switch | `off` | `pc` | Pulse compression / matched filtering |
+| `--autofocus` | switch | `off` | `autofocus` | Autofocus flag |
+| `--sigint` | switch | `off` | `sigint` | SIGINT/passive mode |
+| `--rl-adapt` | switch | `off` | `rl\_adapt` | RL adaptation flag |
+| `--sar-spotlight` | switch | `off` | `sar\_spotlight` | SAR spotlight flag |
+| `--monopulse` | switch | `off` | `monopulse` | Monopulse sum/delta accumulation |
+| `--keystone` | switch | `off` | `keystone` | Keystone range migration compensation |
+| `--rwc` | switch | `off` | `rwc` | Range walk correction |
+| `--autofocus-entropy` | switch | `off` | `autofocus\_entropy` | Entropy autofocus flag |
+| `--lpi-opt` | switch | `off` | `lpi\_opt` | LPI power optimization |
+
+
+### RF / ADC / Timing
+
+Carrier, bandwidth, timing, transmit/receive budget, ADC, oscillator, and analog-impairment controls.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--fc` | double | `10e9` | `fc` | Carrier frequency |
+| `--bw` | double | `1e9` | `bw` | Bandwidth |
+| `--prf` | double | `2000` | `prf` | Pulse repetition frequency |
+| `--pulses` | integer | `256` | `pulses` | Pulse count |
+| `--bits` | integer | `0` | `bits` | ADC quantization bits |
+| `--n-fft` | integer | `128` | `n\_fft` | FFT size |
+| `--tx-pwr` | double | `1000.0` | `tx\_pwr` | Transmit power |
+| `--gain` | double | `30.0` | `gain` | Antenna gain |
+| `--nf` | double | `3.0` | `nf` | Noise figure |
+| `--loss` | double | `2.0` | `loss` | System loss |
+| `--temp` | double | `290.0` | `temp` | Noise temperature |
+| `--pw` | double | `10e-6` | `pw` | Pulse width |
+| `--duty` | double | `0.1` | `duty` | Duty cycle |
+| `--adc-dnl` | double | `0.0` | `adc\_dnl` | ADC DNL coefficient |
+| `--adc-inl` | double | `0.0` | `adc\_inl` | ADC INL coefficient |
+| `--amp-dist` | double | `0.0` | `amp\_dist` | Amplifier distortion |
+| `--pn-slope` | double | `20.0` | `pn\_slope` | Phase-noise slope |
+| `--g-sens` | double | `0.0` | `g\_sens` | G-sensitivity |
+| `--cryo` | switch | `off` | `cryo` | Use cryogenic temperature |
+| `--quant-noise` | switch | `off` | `quant\_noise` | Enable quantization noise/dither |
+| `--phase-bits` | integer | `0` | `phase\_bits` | Phase shifter quantization bits |
+| `--adc-jitter` | double | `0.0` | `adc\_jitter` | ADC jitter |
+| `--rx-recover` | double | `0.0` | `rx\_recover` | Receiver recovery gate |
+| `--lo-leakage` | double | `-100.0` | `lo\_leakage` | LO leakage |
+| `--iip3` | double | `100.0` | `iip3` | Third-order intercept |
+| `--vswr` | double | `1.0` | `vswr` | VSWR mismatch parameter |
+| `--data-loss` | double | `0.0` | `data\_loss` | Data loss parameter |
+| `--thermal-drift` | double | `0.0` | `thermal\_drift` | Thermal phase drift |
+| `--allan-variance` | double | `0.0` | `allan\_variance` | Oscillator Allan variance |
+| `--pa-memory` | integer | `0` | `pa\_memory` | Power-amplifier memory taps |
+
+
+### Geometry / Motion
+
+Radar, target, orbit, platform, and scene-motion controls.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--tx` | vec3 x:y:z meters | `\{0,0,0\}` | `tx` | Transmitter position x:y:z |
+| `--rx` | vec3 x:y:z meters | `\{0,0,0\}` | `rx` | Receiver position x:y:z |
+| `--radar-vel` | vec3 x:y:z m/s | `\{0,0,0\}` | `radar\_vel` | Radar velocity x:y:z |
+| `--orbit` | double | `0.0` | `orbit` | Orbit altitude |
+| `--vibration` | double | `0.0` | `vibration` | Platform vibration |
+| `--earth-k` | double | `1.33` | `earth\_k` | Effective Earth k-factor |
+| `--refractivity` | double | `315.0` | `refractivity` | Surface refractivity |
+| `--pos` | vec3 x:y:z meters | `\{0,15000,5000\}` | `pos` | Target position x:y:z |
+| `--vel` | vec3 x:y:z m/s | `\{100,-50,0\}` | `vel` | Target velocity x:y:z |
+| `--yaw-rate` | double | `3.0` | `yaw\_rate` | Target yaw rate |
+| `--pitch-rate` | double | `0.0` | `pitch\_rate` | Target pitch rate |
+| `--roll-rate` | double | `0.0` | `roll\_rate` | Target roll rate |
+| `--squint-angle` | double | `0.0` | `squint\_angle` | SAR/PFA squint angle |
+| `--hypersonic` | double | `0.0` | `hypersonic` | Hypersonic parameter |
+| `--space-debris` | integer | `0` | `space\_debris` | Space debris flag/count |
+
+
+### Array / Aperture / Polarimetry / RIS
+
+Array geometry, adaptive beamforming, polarimetry, InSAR, RIS, OAM, conformal arrays, and aperture-level impairment controls.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--array` | integer | `16` | `array` | Array element count |
+| `--spacing` | double | `0.015` | `spacing` | Element spacing |
+| `--mvdr` | switch | `off` | `mvdr` | MVDR adaptive processing |
+| `--stap` | switch | `off` | `stap` | STAP approximation |
+| `--stap-smi` | integer | `0` | `stap\_smi` | STAP-SMI snapshots |
+| `--eccm-slb` | switch | `off` | `eccm\_slb` | ECCM sidelobe blanking |
+| `--insar` | double | `0.0` | `insar` | InSAR baseline |
+| `--taper` | string/path/selector | `"uniform"` | `taper` | Array taper |
+| `--scan` | string/path/selector | `"none"` | `scan` | Scan mode |
+| `--scan-rate` | double | `30.0` | `scan\_rate` | Scan rate |
+| `--pol` | string/path/selector | `"HH"` | `pol` | Polarization |
+| `--pol-mode` | string/path/selector | `"std"` | `pol\_mode` | Polarimetric mode |
+| `--ant-file` | string/path/selector | `empty` | `ant\_file` | Antenna file |
+| `--array-fail` | double | `0.0` | `array\_fail` | Element failure probability |
+| `--temp-drift` | double | `0.0` | `temp\_drift` | Array thermal drift |
+| `--hpbw` | double | `0.0` | `hpbw` | Half-power beamwidth |
+| `--noise-fig-rx` | double | `0.0` | `noise\_fig\_rx` | Alternate receiver noise figure |
+| `--mutual-coupling` | switch | `off` | `mutual\_coupling` | Apply mutual-coupling matrix |
+| `--scan-loss` | double | `0.0` | `scan\_loss` | Scan loss |
+| `--amp-err` | double | `0.0` | `amp\_err` | Element amplitude error |
+| `--phase-err` | double | `0.0` | `phase\_err` | Element phase error |
+| `--subarray` | integer | `1` | `subarray` | Subarray size |
+| `--elem-pattern` | string/path/selector | `"isotropic"` | `elem\_pattern` | Element pattern |
+| `--ris` | vec3 x:y:z meters | `false` | `use\_ris` | RIS position x:y:z |
+| `--ris-elements` | integer | `0` | `ris\_elements` | RIS element count |
+| `--ttd` | switch | `off` | `ttd` | True-time-delay flag |
+| `--conformal-array` | string/path/selector | `empty` | `conformal\_array` | Conformal array coordinate file |
+| `--oam-mode` | integer | `0` | `oam\_mode` | OAM array mode |
+| `--cell-free-aps` | integer | `0` | `cell\_free\_aps` | Cell-free AP count Also sets array size to the AP count. |
+
+
+### Waveform / Coding / ISAC
+
+Waveform family, coding, agility, passive illumination, windows, FrFT, deramp, and ISAC modulation.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--wave` | string/path/selector | `"lfm"` | `wave` | Waveform family |
+| `--poly-code` | string/path/selector | `"none"` | `poly\_code` | Polyphase/phase code |
+| `--nlfm` | double | `0.0` | `nlfm` | Nonlinear FM coefficient |
+| `--cognitive` | switch | `off` | `cognitive` | Cognitive waveform flag |
+| `--mimo-mode` | string/path/selector | `"none"` | `mimo\_mode` | MIMO mode |
+| `--stc` | switch | `off` | `stc` | Space-time coding flag |
+| `--hop-rate` | double | `0.0` | `hop\_rate` | Hop rate |
+| `--agile` | switch | `off` | `agile` | Enable agile hopping |
+| `--freq-hop` | string/path/selector | `"random"` | `freq\_hop` | Frequency-hop sequence |
+| `--illuminator` | string/path/selector | `"none"` | `illuminator` | Passive illuminator |
+| `--multiband` | switch | `off` | `multiband` | Multiband flag |
+| `--sei-id` | integer | `0` | `sei\_id` | Emitter ID |
+| `--sync-err` | double | `0.0` | `sync\_err` | Synchronization error |
+| `--rfi` | string/path/selector | `"none"` | `rfi` | RFI model |
+| `--ortho-code` | string/path/selector | `"none"` | `ortho\_code` | Orthogonal code |
+| `--isac-data` | double | `0.0` | `isac\_data` | ISAC data modulation |
+| `--frft` | double | `1.0` | `frft\_order` | Fractional Fourier order |
+| `--deramp` | switch | `off` | `deramp` | Deramp compensation |
+| `--window-range` | string/path/selector | `"none"` | `window\_range` | Range/frequency window |
+| `--window-az` | string/path/selector | `"none"` | `window\_az` | Azimuth/slow-time window |
+| `--kaiser` | double | `2.0` | `kaiser` | Kaiser beta |
+| `--stft-length` | integer | `0` | `stft\_length` | STFT length flag |
+
+
+### Target / RCS / Micro-Doppler / Materials
+
+Built-in targets, RCS files, micro-Doppler effects, material/RAM terms, and target phenomenology.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--target` | string/path/selector | `"f16"` | `target` | Target model |
+| `--rcs-file` | string/path/selector | `empty` | `rcs\_file` | Scatterer/RCS file |
+| `--fading` | string/path/selector | `"none"` | `fading` | Fading model |
+| `--jem` | double | `0.0` | `jem` | Jet/rotor modulation parameter |
+| `--gait-vel` | double | `1.4` | `gait\_vel` | Human gait velocity |
+| `--dielectric` | double | `1000.0` | `dielectric` | Target dielectric constant |
+| `--polar-decomp` | switch | `off` | `polar\_decomp` | Polarimetric decomposition flag |
+| `--terrain` | switch | `off` | `terrain` | Terrain gating flag |
+| `--ai-label` | switch | `off` | `ai\_label` | Write label file |
+| `--rcs-bistatic` | switch | `off` | `rcs\_bistatic` | Bistatic RCS scaling |
+| `--swerling` | integer | `0` | `swerling` | Swerling case |
+| `--drone-rotors` | integer | `0` | `drone\_rotors` | Drone rotor count |
+| `--cavity-return` | double | `0.0` | `cavity\_return` | Cavity return parameter |
+| `--blade-flex` | double | `0.0` | `blade\_flex` | Blade flex parameter |
+| `--bio-clutter` | double | `0.0` | `bio\_clutter` | Biological clutter density |
+| `--acoustic-vibration` | double | `0.0` | `acoustic\_vibration` | Acoustic vibration frequency |
+| `--target-plasma-cloak` | double | `0.0` | `target\_plasma\_cloak` | Target plasma cloak density |
+| `--creeping-wave` | switch | `off` | `creeping\_wave` | Add creeping-wave path |
+| `--glint` | switch | `off` | `glint` | Enable glint displacement |
+| `--exhaust-plume` | double | `0.0` | `exhaust\_plume` | Exhaust plume strength |
+| `--skin-depth` | double | `0.0` | `skin\_depth` | Skin-depth parameter |
+| `--wake-vortex` | double | `0.0` | `wake\_vortex` | Wake vortex offset |
+| `--ram-tensor` | string/path/selector | `empty` | `ram\_tensor` | RAM reflectivity file |
+
+
+### Electronic Attack / Countermeasures
+
+Jamming, DRFM, interference, chaff, cross-eye, and decoy controls.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--jam` | two doubles: azimuth J/S\_dB | `false` | `jammer\_on` | Enable jammer: azimuth and J/S |
+| `--jam-type` | string/path/selector | `"noise"` | `jam\_type` | Jammer type |
+| `--jam-freq` | double | `0.0` | `jam\_freq` | Jammer frequency |
+| `--jam-ftg` | integer | `0` | `jam\_ftg` | False-target generation flag/count |
+| `--interferer` | switch | `off` | `interferer` | Enable interferer |
+| `--drfm-latency` | double | `0.0` | `drfm\_latency` | DRFM latency |
+| `--drfm-bits` | integer | `0` | `drfm\_bits` | DRFM quantization bits |
+| `--jam-pol` | string/path/selector | `"none"` | `jam\_pol` | Jammer polarization |
+| `--chaff-dens` | double | `0.0` | `chaff\_dens` | Chaff density |
+| `--chaff-fall` | double | `0.0` | `chaff\_fall` | Chaff fall velocity |
+| `--crosseye-base` | double | `0.0` | `crosseye\_base` | Cross-eye baseline |
+| `--tow-decoy` | double | `0.0` | `tow\_decoy` | Towed decoy offset |
+| `--lethality` | double | `1e9` | `lethality` | Lethality threshold |
+
+
+### Atmosphere / Propagation / Clutter
+
+Atmospheric loss, ionosphere/troposphere flags, sea/land clutter, weather, vegetation, scintillation, and clutter texture.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--phase-noise` | double | `-100.0` | `phase\_noise` | Phase noise |
+| `--iq-imb` | double | `-100.0` | `iq\_imb` | IQ imbalance |
+| `--ducting` | switch | `off` | `ducting` | Enable ducting |
+| `--duct` | double | `false` | `ducting` | Enable ducting and set height Enables ducting and sets duct height in one flag. |
+| `--duct-ht` | double | `20.0` | `duct\_ht` | Duct height |
+| `--duct-profile` | string/path/selector | `empty` | `duct\_profile` | Duct profile file |
+| `--rain` | double | `0.0` | `rain` | Rain rate/intensity |
+| `--rain-volumetric` | switch | `off` | `rain\_volumetric` | Volumetric rain flag |
+| `--turb` | double | `0.0` | `turb` | Turbulence parameter |
+| `--plasma` | double | `0.0` | `plasma` | Plasma parameter |
+| `--quantum` | switch | `off` | `quantum` | Quantum waveform/noise flag |
+| `--iono` | double | `0.0` | `iono` | Ionospheric parameter |
+| `--atmos` | string/path/selector | `"std"` | `atmos` | Atmospheric model |
+| `--tropo` | switch | `off` | `tropo` | Tropospheric flag |
+| `--cloud` | double | `0.0` | `cloud` | Cloud parameter |
+| `--faraday-rot` | double | `0.0` | `faraday\_rot` | Faraday rotation |
+| `--gas-atten` | switch | `off` | `gas\_atten` | Gas attenuation |
+| `--near-field` | switch | `off` | `near\_field` | Near-field flag |
+| `--circ-pol` | switch | `off` | `circ\_pol` | Circular polarization |
+| `--clutter-dist` | string/path/selector | `"rayleigh"` | `clutter\_dist` | Clutter distribution |
+| `--sea-state` | integer | `0` | `sea\_state` | Sea state |
+| `--clutter-vel` | double | `0.0` | `clutter\_vel` | Clutter velocity |
+| `--clutter-map` | string/path/selector | `empty` | `clutter\_map` | Clutter map file |
+| `--clutter-tex` | double | `0.0` | `clutter\_tex` | Clutter texture correlation |
+| `--sea-spectrum` | string/path/selector | `"none"` | `sea\_spectrum` | Sea spectrum |
+| `--surface-roughness` | double | `0.0` | `surface\_roughness` | Surface roughness |
+| `--scintillation` | double | `0.0` | `scintillation` | Scintillation strength |
+| `--veg-atten` | double | `0.0` | `veg\_atten` | Vegetation attenuation |
+| `--dust-storm` | double | `0.0` | `dust\_storm` | Dust storm parameter |
+| `--snow-rate` | double | `0.0` | `snow\_rate` | Snow rate |
+| `--aurora-abs` | double | `0.0` | `aurora\_abs` | Auroral absorption |
+| `--multipath-diffuse` | double | `0.0` | `multipath\_diffuse` | Diffuse multipath strength |
+| `--sea-temp` | double | `15.0` | `sea\_temp` | Sea temperature |
+| `--wind-shear` | double | `0.0` | `wind\_shear` | Wind-shear clutter gradient |
+| `--starlink-illuminate` | switch | `off` | `starlink\_illuminate` | Use moving passive satellite illuminators |
+
+
+### Detection / Tracking / Output
+
+Detection, tracking, display, file output, metadata, UDP, and accelerator-backend selection.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--pfa` | double | `1e-6` | `pfa` | Probability of false alarm |
+| `--cfar-type` | string/path/selector | `"ca"` | `cfar\_type` | CFAR type |
+| `--cfar-guard` | integer | `2` | `cfar\_guard` | CFAR guard cells |
+| `--cfar-ref` | integer | `4` | `cfar\_ref` | CFAR reference cells |
+| `--mti-order` | integer | `0` | `mti\_order` | MTI order |
+| `--track-alpha` | double | `0.2` | `track\_alpha` | Tracker alpha |
+| `--track-beta` | double | `0.1` | `track\_beta` | Tracker beta |
+| `--tracker` | string/path/selector | `"ab"` | `tracker` | Tracker type |
+| `--tws-revisit` | double | `0.0` | `tws\_revisit` | TWS revisit gate |
+| `--res` | integer | `64` | `res` | Image resolution |
+| `--span` | double | `30.0` | `span` | Image span |
+| `--dyn` | double | `40.0` | `dyn` | Display dynamic range |
+| `--format` | string/path/selector | `"csv"` | `format` | Output format |
+| `--out` | string/path/selector | `empty` | `out` | Output file |
+| `--udp-host` | string/path/selector | `empty` | `udp\_host` | UDP host |
+| `--udp-port` | integer | `0` | `udp\_port` | UDP port |
+| `--meta-file` | string/path/selector | `empty` | `meta\_file` | Metadata JSON output |
+| `--backend` | string/path/selector | `"cpu"` | `backend` | Accelerator backend: cpu|cuda|rocm|vulkan; default cpu |
+| `--accel` | string/path/selector | `"cpu"` | `backend` | Alias for --backend Alias for `--backend`. |
+| `--backend-device` | integer | `0` | `backend\_device` | Accelerator device ordinal |
+| `--backend-info` | switch | `off` | `backend\_info` | Print selected accelerator backend device information |
+| `--backend-verify` | switch | `off` | `backend\_verify` | Compare accelerated products against CPU reference products |
+| `--backend-fallback` | switch | `off` | `backend\_fallback` | Permit CPU fallback if selected backend runtime execution fails |
+| `--backend-tolerance` | double | `1e-7` | `backend\_tolerance` | Maximum relative verification error before failure |
+| `--gpu` | switch | `off` | `gpu` | Legacy alias: request CUDA backend acceleration Legacy alias requesting CUDA backend. |
+| `--cuda` | switch | `off` | `cuda` | Explicitly request CUDA acceleration for supported kernels Explicit CUDA backend selector. |
+| `--cuda-device` | integer | `0` | `cuda\_device` | CUDA device ordinal |
+| `--cuda-info` | switch | `off` | `cuda\_info` | Print CUDA device information |
+| `--cuda-verify` | switch | `off` | `cuda\_verify` | Legacy alias for --backend-verify when using CUDA |
+| `--cuda-fallback` | switch | `off` | `cuda\_fallback` | Legacy alias for --backend-fallback when using CUDA |
+| `--cuda-tolerance` | double | `1e-7` | `cuda\_tolerance` | Legacy backend tolerance selector |
+| `--rocm` | switch | `off` | `rocm` | Explicitly request AMD ROCm/HIP acceleration |
+| `--hip` | switch | `off` | `rocm` | Alias for --rocm Alias for `--rocm`. |
+| `--rocm-device` | integer | `0` | `rocm\_device` | ROCm/HIP device ordinal |
+| `--rocm-info` | switch | `off` | `rocm\_info` | Print ROCm/HIP device information |
+| `--vulkan` | switch | `off` | `vulkan` | Explicitly request Vulkan compute acceleration |
+| `--vulkan-device` | integer | `0` | `vulkan\_device` | Vulkan physical device ordinal |
+| `--vulkan-info` | switch | `off` | `vulkan\_info` | Print Vulkan device information |
+| `--pfa-algo` | string/path/selector | `"bp"` | `pfa\_algo` | Image formation algorithm |
+| `--backproj-interp` | string/path/selector | `"linear"` | `backproj\_interp` | Backprojection interpolation selector |
+| `--atr-model` | string/path/selector | `empty` | `atr\_model` | ONNX ATR model path |
+| `--sbr` | integer | `0` | `sbr` | Simple two-bounce SBR flag |
+
+
+### Compatibility flags parsed by the CLI
+
+Legacy/compatibility flags retained so old command lines continue to parse.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--help` | switch | `n/a` | `n/a` | Parsed CLI flag retained for compatibility |
+| `--mprf-schedule` | integer | `0` | `mprf\_schedule` | Parsed CLI flag retained for compatibility |
+| `--multistatic` | integer | `0` | `multistatic` | Parsed CLI flag retained for compatibility |
+| `--quantum-entangled` | double | `0.0` | `quantum\_entangled` | Parsed CLI flag retained for compatibility |
+| `--rx-rydberg` | switch | `off` | `rx\_rydberg` | Parsed CLI flag retained for compatibility |
+| `--stagger` | switch | `off` | `stagger` | Parsed CLI flag retained for compatibility |
+
+
+### Research Grade Release 2
+
+Scenario files, research exports, truth metrics, Monte Carlo, MIMO/DOA/RAD, advanced imaging, clutter, target ingestion, EW metrics, tracking/TBD, detectors, super-resolution, interoperability, validation, and profiling.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--scenario` | string/path/selector | `empty` | `scenario\_file` | Load YAML/JSON scenario definition before CLI overrides Loaded before normal CLI overrides; later command-line flags take precedence. |
+| `--save-scenario` | string/path/selector | `empty` | `save\_scenario` | Write resolved scenario JSON |
+| `--output-dir` | string/path/selector | `empty` | `output\_dir` | Directory prefix for generated artifacts |
+| `--run-id` | string/path/selector | `"default"` | `run\_id` | Experiment/run identifier |
+| `--monte-carlo` | integer | `0` | `monte\_carlo` | Run child-process Monte Carlo campaign count |
+| `--mc-summary` | string/path/selector | `empty` | `mc\_summary` | Monte Carlo summary CSV |
+| `--export-raw-iq` | string/path/selector | `empty` | `export\_raw\_iq` | Complex binary raw IQ history export |
+| `--export-range-cube` | string/path/selector | `empty` | `export\_range\_cube` | Range-compressed complex CSV cube |
+| `--export-rdm-complex` | string/path/selector | `empty` | `export\_rdm\_complex` | Complex range-Doppler CSV export |
+| `--export-rdm-mag` | string/path/selector | `empty` | `export\_rdm\_mag` | Magnitude RDM CSV export |
+| `--export-threshold-map` | string/path/selector | `empty` | `export\_threshold\_map` | Detector threshold map CSV |
+| `--export-detection-mask` | string/path/selector | `empty` | `export\_detection\_mask` | Binary detection mask CSV |
+| `--metrics-out` | string/path/selector | `empty` | `metrics\_out` | Truth-aligned metrics JSON |
+| `--detections-out` | string/path/selector | `empty` | `detections\_out` | Detections CSV |
+| `--axes-out` | string/path/selector | `empty` | `axes\_out` | Calibrated range/Doppler/velocity axes CSV |
+| `--image-out` | string/path/selector | `empty` | `image\_out` | Portable grayscale PGM image |
+| `--truth-out` | string/path/selector | `empty` | `truth\_out` | Truth state CSV |
+| `--detection-top-k` | integer | `0` | `detection\_top\_k` | Keep strongest N detections |
+| `--detection-min-db` | double | `-120.0` | `detection\_min\_db` | Minimum relative dB for exported detections |
+| `--cfar-exact-alpha` | switch | `off` | `cfar\_exact\_alpha` | Use reference-count CA-CFAR alpha |
+| `--output-log-db` | switch | `off` | `output\_log\_db` | Use log scale for image interoperability output |
+| `--detector` | string/path/selector | `"cfar"` | `detector` | cfar|glrt|amf|ace|wald|rao |
+| `--noise-model` | string/path/selector | `"gaussian"` | `noise\_model` | Detection noise model label |
+| `--roc-out` | string/path/selector | `empty` | `roc\_out` | Threshold sweep CSV |
+| `--pd-pfa-out` | string/path/selector | `empty` | `pd\_pfa\_out` | Pd/Pfa sweep CSV |
+| `--mimo-tx` | integer | `1` | `mimo\_tx` | MIMO transmitter count metadata |
+| `--mimo-rx` | integer | `0` | `mimo\_rx` | MIMO receiver/array count |
+| `--mimo-virtual-array` | switch | `off` | `mimo\_virtual\_array` | Enable virtual-array products |
+| `--mimo-code` | string/path/selector | `"tdm"` | `mimo\_code` | tdm|fdm|ddm|hadamard metadata |
+| `--doa` | string/path/selector | `"none"` | `doa` | none|bartlett|capon|music |
+| `--angle-grid` | min:max:step degrees | `-60.0` | `angle\_min` | min:max:step angle grid in degrees |
+| `--angle-out` | string/path/selector | `empty` | `angle\_out` | DOA spectrum CSV |
+| `--range-angle-out` | string/path/selector | `empty` | `range\_angle\_out` | Range-angle product path |
+| `--rad-cube-out` | string/path/selector | `empty` | `rad\_cube\_out` | Range-angle-Doppler tensor CSV |
+| `--rad-range-bins` | integer | `0` | `rad\_range\_bins` | RAD range-bin count |
+| `--rad-doppler-bins` | integer | `0` | `rad\_doppler\_bins` | RAD Doppler-bin count |
+| `--rad-angle-bins` | integer | `0` | `rad\_angle\_bins` | RAD angle-bin count |
+| `--isar-algo` | string/path/selector | `"bp"` | `isar\_algo` | bp|pfa|rma|omega-k|range-doppler|chirp-scaling selector |
+| `--motion-comp` | string/path/selector | `"none"` | `motion\_comp` | Motion-compensation selector |
+| `--autofocus-algo` | string/path/selector | `"none"` | `autofocus\_algo` | pga|entropy|min-variance selector |
+| `--trajectory-file` | string/path/selector | `empty` | `trajectory\_file` | Trajectory CSV input |
+| `--clutter-model` | string/path/selector | `empty` | `clutter\_model` | rayleigh|weibull|lognormal|k-distribution|pareto|compound-gaussian |
+| `--clutter-correlation-time` | double | `0.0` | `clutter\_correlation\_time` | Clutter time-correlation parameter |
+| `--clutter-correlation-range` | double | `0.0` | `clutter\_correlation\_range` | Clutter range-correlation parameter |
+| `--terrain-dem` | string/path/selector | `empty` | `terrain\_dem` | Terrain DEM CSV metadata path |
+| `--landcover-map` | string/path/selector | `empty` | `landcover\_map` | Land-cover CSV metadata path |
+| `--sea-bragg` | switch | `off` | `sea\_bragg` | Enable Bragg-like sea modulation |
+| `--sea-wind-speed` | double | `0.0` | `sea\_wind\_speed` | Sea wind speed parameter |
+| `--sea-wind-dir` | double | `0.0` | `sea\_wind\_dir` | Sea wind direction parameter |
+| `--target-mesh` | string/path/selector | `empty` | `target\_mesh` | OBJ mesh target ingestion |
+| `--mesh-rcs-mode` | string/path/selector | `"facet"` | `mesh\_rcs\_mode` | Mesh RCS mode |
+| `--scatterer-file` | string/path/selector | `empty` | `scatterer\_file` | Typed scatterer table ingestion |
+| `--rcs-table` | string/path/selector | `empty` | `rcs\_table` | Aspect RCS table metadata path |
+| `--aspect-rcs` | switch | `off` | `aspect\_rcs` | Aspect dependent RCS flag |
+| `--ew-scenario` | string/path/selector | `empty` | `ew\_scenario` | EW scenario file metadata path |
+| `--burnthrough-out` | string/path/selector | `empty` | `burnthrough\_out` | Burn-through estimate CSV |
+| `--jamming-metrics-out` | string/path/selector | `empty` | `jamming\_metrics\_out` | EW metrics JSON |
+| `--ep-mode` | string/path/selector | `"none"` | `ep\_mode` | none|adaptive-notch|sidelobe-blanking|polarization-filter |
+| `--jammer-count` | integer | `1` | `jammer\_count` | Number of modeled jammers for metrics |
+| `--targets-file` | string/path/selector | `empty` | `targets\_file` | Multi-target truth CSV |
+| `--track-out` | string/path/selector | `empty` | `track\_out` | Track CSV output |
+| `--track-metrics-out` | string/path/selector | `empty` | `track\_metrics\_out` | Tracking metrics JSON |
+| `--tbd-grid` | string/path/selector | `"range"` | `tbd\_grid` | Track-before-detect grid selector |
+| `--tbd-integrator` | string/path/selector | `"viterbi"` | `tbd\_integrator` | viterbi|hmm|particle label |
+| `--tbd-window` | integer | `8` | `tbd\_window` | TBD integration window |
+| `--tbd-out` | string/path/selector | `empty` | `tbd\_out` | TBD path CSV |
+| `--superres` | string/path/selector | `"none"` | `superres` | none|parabolic|music|matrix-pencil selector |
+| `--superres-domain` | string/path/selector | `"range"` | `superres\_domain` | range|doppler|angle selector |
+| `--sparse-lambda` | double | `0.01` | `sparse\_lambda` | Sparse estimator regularization parameter |
+| `--superres-out` | string/path/selector | `empty` | `superres\_out` | Super-resolution estimate CSV |
+| `--export-sigmf` | string/path/selector | `empty` | `export\_sigmf` | SigMF base path |
+| `--export-matlab` | string/path/selector | `empty` | `export\_matlab` | MATLAB v4 MAT image export |
+| `--export-numpy` | string/path/selector | `empty` | `export\_numpy` | NumPy .npy image export |
+| `--export-vita49` | string/path/selector | `empty` | `export\_vita49` | VITA-49/VRT binary export |
+| `--validate-physics` | switch | `off` | `validate\_physics` | Run internal formal validation suite |
+| `--validation-report` | string/path/selector | `empty` | `validation\_report` | Validation JSON path |
+| `--profile` | switch | `off` | `profile` | Enable profile metadata |
+| `--profile-out` | string/path/selector | `empty` | `profile\_out` | Profile JSON path |
+
+
+### Additional parsed flags not present in the legacy manifest
+
+Flags found directly in `parse\_args()` and documented here to ensure the README matches the source exactly.
+
+| Flag | Value type | Default | Config field | Detailed behavior |
+| - | -: | -: | - | - |
+| `--mc-vary` | string/path/selector | `empty` | `mc\_vary` | Monte Carlo variation specification string used to document/sweep campaign variables alongside child-run seeds. |
+| `--cube-format` | string/path/selector | `"csv"` | `cube\_format` | Selects data-cube export encoding policy. The dependency-free release writes CSV and binary products directly; this value is retained in metadata and future-proofs external cube containers. |
+| `--threshold-map-out` | string/path/selector | `empty` | `threshold\_map\_out` | Writes the detector threshold map to a separate path. Use with `--export-threshold-map` when you want threshold products independent of the main image. |
+| `--grazing-model` | string/path/selector | `"geometric"` | `grazing\_model` | Selects/labels the grazing-angle model used by clutter and propagation studies. The default geometric path uses target/receiver geometry. |
+| `--material-file` | string/path/selector | `empty` | `material\_file` | Material metadata file for target/scatterer studies. Use this with mesh/scatterer ingestion when documenting material-dependent runs. |
+| `--track-gate` | double | `2.5` | `track\_gate` | Tracker association gate threshold. Used to decide whether a measurement belongs to an existing track. |
+| `--track-gate-type` | string/path/selector | `"euclidean"` | `track\_gate\_type` | Tracker gate metric selector. The default is Euclidean; runs may record other gate-model labels for analysis. |
+| `--track-confirm` | m:n string | `"2:3"` | `track\_confirm` | Track confirmation rule in m:n form. Example: `2:3` means require at least two detections across a three-frame confirmation window. |
+
+
+## Recommended research workflows
+
+### 1. Deterministic algorithm regression
+
+Use deterministic RNG and fixed seeds when comparing code changes, compiler options, or backends:
+
+```
+OMP\_NUM\_THREADS=1 ./raptor --det-par --seed 42 --mode rdm --rdm-2d --out a.csv  
+OMP\_NUM\_THREADS=4 ./raptor --det-par --seed 42 --mode rdm --rdm-2d --out b.csv
+```
+
+### 2. Detection-performance study
+
+```
+./raptor --det-par --seed 7 --mode rdm --rdm-2d --cfar-2d \\  
+  --detector glrt --metrics-out metrics.json --detections-out detections.csv \\  
+  --roc-out roc.csv --pd-pfa-out pdpfa.csv --truth-out truth.csv
+```
+
+### 3. MIMO/DOA/RAD product generation
+
+```
+./raptor --mode rad --rdm-2d --mimo-virtual-array --mimo-tx 2 --mimo-rx 8 \\  
+  --doa music --angle-grid -70:70:1 --angle-out music.csv \\  
+  --range-angle-out range\_angle.csv --rad-cube-out rad.csv
+```
+
+### 4. Contested-spectrum / EW analysis
+
+```
+./raptor --mode rdm --rdm-2d --jam 15 35 --jam-type drfm \\  
+  --drfm-latency 75 --drfm-bits 8 --interferer --ep-mode adaptive-notch \\  
+  --burnthrough-out burnthrough.csv --jamming-metrics-out ew.json
+```
+
+### 5. Target ingestion
+
+```
+./raptor --target-mesh examples/simple\_target.obj --scatterer-file examples/scatterers.csv \\  
+  --targets-file examples/targets.csv --truth-out truth.csv --track-out tracks.csv
+```
+
+## Implementation notes and limitations
+
+- The default build is intentionally dependency-free and uses a built-in radix-2 FFT. FFT sizes are validated and rounded to a power of two when needed.
+
+- The analytical engine is a research simulation model, not a certified radar design tool. It emphasizes reproducible algorithm experimentation and comparative studies.
+
+- Several research flags select lightweight internal models rather than external packages; outputs are explicit so results can be inspected and validated externally.
+
+- Accelerator support is optional. CPU remains the canonical reference path; `--backend-verify` is intended for accelerator/CPU product comparisons.
+
+- The FDTD solver is separate from the analytical imaging engine and is selected with `--solver fdtd`.
+
+- Scenario parsing supports a practical YAML/JSON subset without external dependencies; it is not a full YAML 1.2 parser.
+
+- MATLAB export uses a dependency-free MATLAB v4-style image output path; NumPy export writes `.npy`-style array products where implemented.
+
+## License / usage note
+
+No license file is included in this generated package. Add an explicit project license before publishing or redistributing outside your own research environment.
